@@ -41,7 +41,11 @@ You need to implement a Triton kernel for a PyTorch operator.
 
 ### Input/Output Arguments
 
-(See vllm13 documentation for parameter details)
+The three output buffers are indexed by adapter ID. Allocate
+max_loras * max_num_tokens_padded token slots, max_loras * max_num_m_blocks
+expert slots, and max_loras padded-token counters. Use the input lora_ids and
+adapter_enabled arrays to select adapters. Token order within one adapter and
+expert is unspecified; routing membership and padding must match.
 
 ## Implementation Requirements
 

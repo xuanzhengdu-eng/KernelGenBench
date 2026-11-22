@@ -15,7 +15,6 @@
 import kernelgenbench
 from sandbox.config import DEVICE as device
 from sandbox.verifier.test_parametrize import parametrize, label
-from sandbox.utils.accuracy_utils import kernelgenbench_assert_close as assert_close
 from sandbox.utils.accuracy_utils import CustomBenchmarkResult
 import torch
 import triton
@@ -34,83 +33,64 @@ import triton
     (64, 2, 8, 4, 2),
 ])
 def test_accuracy_moe_lora_align_block_size(config):
-    num_tokens = config[0]
-    topk = config[1]
-    num_experts = config[2]
-    block_size = config[3]
-    max_loras = config[4]
-
+    num_tokens, topk, num_experts, block_size, max_loras = config
     max_num_tokens_padded = num_tokens * topk + num_experts * block_size
     max_num_m_blocks = max_num_tokens_padded // block_size
+    token_count = num_tokens * topk
 
-    topk_ids = torch.randint(0, num_experts, (num_tokens, topk),
-                             device=device, dtype=torch.int32)
-    token_lora_mapping = torch.zeros(num_tokens, device=device, dtype=torch.int32)
+    def make_topk_ids():
+        return torch.randint(0, num_experts, (num_tokens, topk), device=device, dtype=torch.int32)
 
-    ref_sorted = torch.zeros(max_num_tokens_padded, device=device, dtype=torch.int32)
-    ref_experts = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    ref_ntp = torch.zeros(1, device=device, dtype=torch.int32)
-    ref_adapter = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    ref_lora = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
+    lora_ids = torch.arange(max_loras, device=device, dtype=torch.int32)
+    mapping = torch.arange(num_tokens, device=device, dtype=torch.int32) % max_loras
+    enabled = torch.ones_like(lora_ids)
 
-    act_sorted = torch.zeros(max_num_tokens_padded, device=device, dtype=torch.int32)
-    act_experts = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    act_ntp = torch.zeros(1, device=device, dtype=torch.int32)
-    act_adapter = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    act_lora = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
+    def make_output_buffers():
+        return (
+            torch.full((max_loras * max_num_tokens_padded,), token_count, device=device, dtype=torch.int32),
+            torch.full((max_loras * max_num_m_blocks,), -1, device=device, dtype=torch.int32),
+            torch.zeros_like(lora_ids),
+        )
 
-    kernelgenbench.baseline.moe_lora_align_block_size(
-        topk_ids, token_lora_mapping, num_experts, block_size,
-        max_loras, max_num_tokens_padded, max_num_m_blocks,
-        ref_sorted, ref_experts, ref_ntp, ref_adapter, ref_lora, None)
+    def run(operation, ids, outputs):
+        operation(
+            ids, mapping, num_experts, block_size,
+            max_loras, max_num_tokens_padded, max_num_m_blocks,
+            *outputs, enabled, lora_ids, None,
+        )
 
-    kernelgenbench.triton.moe_lora_align_block_size(
-        topk_ids, token_lora_mapping, num_experts, block_size,
-        max_loras, max_num_tokens_padded, max_num_m_blocks,
-        act_sorted, act_experts, act_ntp, act_adapter, act_lora, None)
+    baseline = kernelgenbench.baseline.moe_lora_align_block_size
+    candidate = kernelgenbench.triton.moe_lora_align_block_size
+    ids = make_topk_ids()
+    ref_output = make_output_buffers()
+    act_output = make_output_buffers()
+    run(baseline, ids, ref_output)
+    run(candidate, ids, act_output)
+    ref_sorted, ref_experts, ref_ntp = ref_output
+    act_sorted, act_experts, act_ntp = act_output
 
-    assert torch.equal(act_sorted, ref_sorted), \
-        f"sorted_token_ids mismatch: max diff={(act_sorted - ref_sorted).abs().max()}"
-    assert torch.equal(act_experts, ref_experts), \
-        f"experts_ids mismatch: max diff={(act_experts - ref_experts).abs().max()}"
-    assert torch.equal(act_ntp, ref_ntp), \
-        f"num_tokens_post_pad mismatch: {act_ntp.item()} vs {ref_ntp.item()}"
+    assert (ref_ntp > 0).all(), "Every test adapter must route at least one token"
+    assert torch.equal(act_ntp, ref_ntp), "Padded token counts do not match"
+    assert torch.equal(act_experts, ref_experts), "Expert ids do not match"
+    assert ((act_sorted >= 0) & (act_sorted <= token_count)).all(), "Invalid token id"
 
-    # ===== Performance Test =====
+    # The native large-batch path assigns positions with atomic increments, so
+    # the order is unspecified within an expert. Keep adapter and expert
+    # boundaries, token multiplicity, and the padding sentinel in the comparison.
+    expert_groups = ref_experts.reshape(max_loras, -1).repeat_interleave(block_size, dim=1)
+    expert_keys = (expert_groups.to(torch.int64) + 1) * (token_count + 1)
+    ref_keys = expert_keys + ref_sorted.reshape(max_loras, -1)
+    act_keys = expert_keys + act_sorted.reshape(max_loras, -1)
+    assert torch.equal(act_keys.sort(dim=1).values, ref_keys.sort(dim=1).values), "Token routing does not match"
+
     if num_tokens < 128 or num_experts < 16:
         return None
 
-    topk_ids_bench = torch.randint(0, num_experts, (num_tokens, topk),
-                                   device=device, dtype=torch.int32)
-    token_lora_mapping_bench = torch.zeros(num_tokens, device=device, dtype=torch.int32)
-    sorted_baseline = torch.zeros(max_num_tokens_padded, device=device, dtype=torch.int32)
-    experts_baseline = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    ntp_baseline = torch.zeros(1, device=device, dtype=torch.int32)
-    adapter_baseline = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    lora_baseline = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    sorted_triton = torch.zeros(max_num_tokens_padded, device=device, dtype=torch.int32)
-    experts_triton = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    ntp_triton = torch.zeros(1, device=device, dtype=torch.int32)
-    adapter_triton = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-    lora_triton = torch.zeros(max_num_m_blocks, device=device, dtype=torch.int32)
-
-    ms_baseline = triton.testing.do_bench(
-        lambda: kernelgenbench.baseline.moe_lora_align_block_size(
-            topk_ids_bench, token_lora_mapping_bench, num_experts, block_size,
-            max_loras, max_num_tokens_padded, max_num_m_blocks,
-            sorted_baseline, experts_baseline, ntp_baseline,
-            adapter_baseline, lora_baseline, None),
-        warmup=25, rep=100
-    )
-
-    ms_triton = triton.testing.do_bench(
-        lambda: kernelgenbench.triton.moe_lora_align_block_size(
-            topk_ids_bench, token_lora_mapping_bench, num_experts, block_size,
-            max_loras, max_num_tokens_padded, max_num_m_blocks,
-            sorted_triton, experts_triton, ntp_triton,
-            adapter_triton, lora_triton, None),
-        warmup=25, rep=100
-    )
+    ids_bench = make_topk_ids()
+    ref_bench = make_output_buffers()
+    act_bench = make_output_buffers()
+    ms_baseline = triton.testing.do_bench(lambda: run(baseline, ids_bench, ref_bench), warmup=25, rep=100)
+    ms_triton = triton.testing.do_bench(lambda: run(candidate, ids_bench, act_bench), warmup=25, rep=100)
 
     speedup = ms_baseline / ms_triton if ms_triton > 0 else float('inf')
     return CustomBenchmarkResult(
