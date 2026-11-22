@@ -29,7 +29,12 @@ def cp_gather_indexer_k_quant_cache(
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor
 ) -> None:
-    """Wrapper for vLLM cp_gather_indexer_k_quant_cache implementation."""
+    """Gather packed key and scale bytes using the vLLM 0.13 cache ABI.
+
+    The cache is a uint8 tensor with all key bytes followed by scale bytes
+    within each block. The destinations are two-dimensional byte buffers
+    for keys and for the raw bytes of the FP32 quantization scales.
+    """
     _custom_ops.cp_gather_indexer_k_quant_cache(
         kv_cache,
         dst_k,

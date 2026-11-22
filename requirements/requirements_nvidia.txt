@@ -26,6 +26,7 @@ tqdm>=4.67.3
 fastapi>=0.134.0
 uvicorn>=0.41.0
 scipy
+pytest
 ijson>=3.5.0
 
 # vLLM baseline (NVIDIA-only, pulls torch>=2.9.0 and triton>=3.5.0)

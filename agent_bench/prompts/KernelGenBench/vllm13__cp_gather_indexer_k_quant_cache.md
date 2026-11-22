@@ -41,7 +41,17 @@ You need to implement a Triton kernel for a PyTorch operator.
 
 ### Input/Output Arguments
 
-(See vllm13 documentation for parameter details)
+The vLLM 0.13 ABI accepts uint8 cache and destination buffers. Inside each
+cache block, the key bytes for every token are contiguous, followed by the
+bytes of their FP32 scales. Each scale describes 128 key bytes.
+
+- kv_cache: [num_blocks, block_size, head_dim + 4 * (head_dim / 128)]
+- dst_k: [num_tokens, head_dim]
+- dst_scale: [num_tokens, 4 * (head_dim / 128)]
+- block_table: int32 [batch_size, blocks_per_seq]
+- cu_seq_lens: int32 [batch_size + 1]
+
+The operator writes both destination buffers in place.
 
 ## Implementation Requirements
 

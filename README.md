@@ -61,6 +61,18 @@ OpenAI-compatible or Anthropic-compatible endpoint can be used directly with
 
 👉 **For detailed setup, see [Getting Started](docs/source/getting-started/index.md).**
 
+### NVIDIA A100 reference check
+
+After installing the NVIDIA dependencies, select one GPU to exercise the registered correctness and timing cases with the native reference implementations:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/check_references.py --output runs/a100-reference
+```
+
+Use `--shard INDEX COUNT` (zero-based) with a different GPU and result directory per shard to check in parallel. A nonzero exit code reports a missing test, a skipped or failed case, or a CUDA error. For a separate process per operator, invoke the command with `--operators NAMESPACE::NAME` and separate output directories. Run performance comparisons on dedicated GPUs with the normal LLM or Agent Track.
+
+The A100 branch restores ATen case grids from public Git history and fixes pointer mode in the existing cuBLAS baselines. It retains all 210 problem identifiers. Record the revision when comparing scores because restored tests change the coverage of the affected operators.
+
 ## Documentation
 
 📚 **Full documentation**: [docs/source/](docs/source/)

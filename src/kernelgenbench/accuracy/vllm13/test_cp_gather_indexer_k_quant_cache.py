@@ -15,10 +15,20 @@
 import kernelgenbench
 from sandbox.config import DEVICE as device
 from sandbox.verifier.test_parametrize import parametrize, label
-from sandbox.utils.accuracy_utils import kernelgenbench_assert_close as assert_close
 from sandbox.utils.accuracy_utils import CustomBenchmarkResult
 import torch
 import triton
+
+def make_packed_cache(num_blocks, block_size, head_dim):
+    # vLLM 0.13 uses one FP32 scale per 128 bytes. Each cache block
+    # contains all key bytes followed by the FP32 scales for that block.
+    keys = torch.randint(0, 256, (num_blocks, block_size, head_dim),
+                         device=device, dtype=torch.uint8)
+    scales = torch.rand(num_blocks, block_size, head_dim // 128, device=device)
+    scale_bytes = scales.view(torch.uint8)
+    cache = torch.cat((keys.flatten(1), scale_bytes.flatten(1)), dim=1)
+    return cache.view(num_blocks, block_size, -1), keys, scale_bytes
+
 
 @label("cp_gather_indexer_k_quant_cache")
 @parametrize("config", [
@@ -37,14 +47,9 @@ import triton
     (128, 64, 8, 256, 8),
 ])
 def test_accuracy_cp_gather_indexer_k_quant_cache(config):
-    num_blocks = config[0]
-    block_size = config[1]
-    num_heads = config[2]
-    head_size = config[3]
-    batch_size = config[4]
-
-    kv_cache = torch.randn(num_blocks, block_size, num_heads, head_size,
-                           device=device, dtype=torch.float16)
+    num_blocks, block_size, num_heads, head_size, batch_size = config
+    head_dim = num_heads * head_size
+    kv_cache, keys, scales = make_packed_cache(num_blocks, block_size, head_dim)
     blocks_per_seq = 2
     total_tokens = batch_size * blocks_per_seq * block_size
 
@@ -54,39 +59,28 @@ def test_accuracy_cp_gather_indexer_k_quant_cache(config):
                           blocks_per_seq * block_size,
                           device=device, dtype=torch.int32)
 
-    ref_k = torch.zeros(total_tokens, num_heads, head_size,
-                        device=device, dtype=torch.float16)
-    ref_s = torch.zeros(total_tokens, num_heads,
-                        device=device, dtype=torch.float32)
-    act_k = torch.zeros(total_tokens, num_heads, head_size,
-                        device=device, dtype=torch.float16)
-    act_s = torch.zeros(total_tokens, num_heads,
-                        device=device, dtype=torch.float32)
+    selected_blocks = block_table.flatten().long()
+    expected_k = keys[selected_blocks].reshape(total_tokens, head_dim)
+    expected_s = scales[selected_blocks].reshape(total_tokens, -1)
+    ref_k, act_k = torch.empty_like(expected_k), torch.empty_like(expected_k)
+    ref_s, act_s = torch.empty_like(expected_s), torch.empty_like(expected_s)
 
     kernelgenbench.baseline.cp_gather_indexer_k_quant_cache(
         kv_cache, ref_k, ref_s, block_table, cu_seq)
     kernelgenbench.triton.cp_gather_indexer_k_quant_cache(
         kv_cache, act_k, act_s, block_table, cu_seq)
 
-    assert torch.equal(act_k, ref_k), \
-        f"k mismatch: max diff={(act_k - ref_k).abs().max()}"
-    assert torch.equal(act_s, ref_s), \
-        f"scale mismatch: max diff={(act_s - ref_s).abs().max()}"
+    torch.testing.assert_close(ref_k, expected_k, rtol=0, atol=0)
+    torch.testing.assert_close(ref_s, expected_s, rtol=0, atol=0)
+    torch.testing.assert_close(act_k, ref_k, rtol=0, atol=0)
+    torch.testing.assert_close(act_s, ref_s, rtol=0, atol=0)
 
-    # ===== Performance Test =====
     if num_blocks < 16 or batch_size < 4:
         return None
 
-    kv_cache_bench = torch.randn(num_blocks, block_size, num_heads, head_size,
-                                 device=device, dtype=torch.float16)
-    k_baseline = torch.zeros(total_tokens, num_heads, head_size,
-                            device=device, dtype=torch.float16)
-    s_baseline = torch.zeros(total_tokens, num_heads,
-                            device=device, dtype=torch.float32)
-    k_triton = torch.zeros(total_tokens, num_heads, head_size,
-                          device=device, dtype=torch.float16)
-    s_triton = torch.zeros(total_tokens, num_heads,
-                          device=device, dtype=torch.float32)
+    kv_cache_bench, _, _ = make_packed_cache(num_blocks, block_size, head_dim)
+    k_baseline, k_triton = torch.empty_like(ref_k), torch.empty_like(ref_k)
+    s_baseline, s_triton = torch.empty_like(ref_s), torch.empty_like(ref_s)
 
     ms_baseline = triton.testing.do_bench(
         lambda: kernelgenbench.baseline.cp_gather_indexer_k_quant_cache(
