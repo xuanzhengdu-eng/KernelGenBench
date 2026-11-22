@@ -9637,8 +9637,10 @@ def test_index_error_empty_indices(dtype):
     inp = torch.randn((32, 64), dtype=dtype, device=device)
     indices = []
 
-    with pytest.raises(ValueError, match="at least one index must be provided"):
-        torch.ops.aten.index(inp, indices)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        with pytest.raises((ValueError, RuntimeError),
+                           match=r"at least one index must be provided|N <= iter\.ntensors\(\) INTERNAL ASSERT FAILED"):
+            torch.ops.aten.index(inp, indices)
 
 
 

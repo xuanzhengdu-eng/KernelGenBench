@@ -19,27 +19,12 @@ from sandbox.utils.accuracy_utils import kernelgenbench_assert_close as assert_c
 from sandbox.utils.accuracy_utils import CustomBenchmarkResult
 import torch
 import triton
-import struct
+from kernelgenbench.accuracy.vllm13._ggml import make_q8_0_data
+
 
 def _make_q8_0_weight(num_experts, row, n):
-    """Construct valid GGML Q8_0 quantized MoE weight tensor.
+    return make_q8_0_data((num_experts, row), n, device)
 
-    Q8_0: each block of 32 values = 2 bytes fp16 scale + 32 bytes int8 = 34 bytes.
-    Shape: (num_experts, row, n_blocks_per_row * 34)
-    """
-    bytes_per_block = 34
-    n_blocks = n // 32
-    W = torch.zeros(num_experts, row, n_blocks * bytes_per_block, dtype=torch.uint8)
-    for e in range(num_experts):
-        for r in range(row):
-            for b in range(n_blocks):
-                off = b * bytes_per_block
-                scale = torch.randn(1).abs().item() * 0.5 + 0.1
-                sb = struct.pack('<e', scale)
-                W[e, r, off] = sb[0]
-                W[e, r, off + 1] = sb[1]
-                W[e, r, off + 2:off + 34] = torch.randint(0, 256, (32,), dtype=torch.uint8)
-    return W.to(device)
 
 @label("ggml_moe_a8_vec")
 @parametrize("config", [

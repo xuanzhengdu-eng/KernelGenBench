@@ -19,26 +19,12 @@ from sandbox.utils.accuracy_utils import kernelgenbench_assert_close as assert_c
 from sandbox.utils.accuracy_utils import CustomBenchmarkResult
 import torch
 import triton
-import struct
+from kernelgenbench.accuracy.vllm13._ggml import make_q8_0_data
+
 
 def _make_q8_0_data(rows, cols):
-    """Construct valid GGML Q8_0 quantized data.
+    return make_q8_0_data((rows,), cols, device)
 
-    Q8_0 format: each block of 32 values = 2 bytes fp16 scale + 32 bytes int8.
-    Total 34 bytes per block.
-    """
-    n_blocks_per_row = cols // 32
-    bytes_per_block = 34
-    data = torch.zeros(rows, n_blocks_per_row * bytes_per_block, dtype=torch.uint8)
-    for r in range(rows):
-        for b in range(n_blocks_per_row):
-            offset = b * bytes_per_block
-            scale = torch.randn(1).abs().item() * 0.5 + 0.1
-            scale_bytes = struct.pack('<e', scale)
-            data[r, offset] = scale_bytes[0]
-            data[r, offset + 1] = scale_bytes[1]
-            data[r, offset + 2:offset + 34] = torch.randint(0, 256, (32,), dtype=torch.uint8)
-    return data.to(device)
 
 @label("ggml_dequantize")
 @parametrize("config", [
