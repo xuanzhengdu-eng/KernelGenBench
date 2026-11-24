@@ -551,6 +551,13 @@ def gpu_profiling_check(
         logger.warning(f"GPU profiling failed: {e}")
         return False, ""
 
+    # The profiler reports CUDA memcpy/memset activities alongside kernels.
+    # They cannot establish that the candidate launched a Triton kernel and
+    # must not make a collection of native CUDA kernels look non-native.
+    cuda_kernels = [
+        name for name in cuda_kernels
+        if not name.lower().startswith(("memcpy", "memset", "cudamemcpy", "cudamemset"))
+    ]
     if not cuda_kernels:
         return True, "GPU profiling hack detected: no CUDA kernels launched at all."
 

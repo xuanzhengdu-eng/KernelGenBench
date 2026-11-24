@@ -660,7 +660,8 @@ class Verifier:
         speedup = None
         first_failure_traceback = None  # Store first failure traceback for reporting
         first_func_combo = None
-        first_normal_output = None  # Saved from accuracy test for Layer 2 optimization
+        measured_func_combo = None
+        measured_normal_output = None
         for func, mark in funcs:
             func_name = func.__name__
             if func is None:
@@ -693,8 +694,13 @@ class Verifier:
                         started_path = None
                 try:
                     ret = func(**combo)
-                    if first_normal_output is None:
-                        first_normal_output = deepcopy(ret) if ret is not None else None
+                    # Some tests immediately return None for an unsupported or
+                    # empty configuration. Prefer a case that returned a
+                    # benchmark result for runtime anti-hack checks, and keep
+                    # its normal output paired with the same parameters.
+                    if ret is not None and measured_func_combo is None:
+                        measured_func_combo = (func, deepcopy(combo))
+                        measured_normal_output = deepcopy(ret)
                 except Exception as e:
                     tb_str = traceback.format_exc()
                     success = False
@@ -794,13 +800,15 @@ class Verifier:
         # Anti-hack Layer 2 & 3: only when config.anti_hack is enabled
         if self._running_config.anti_hack and failed == 0 and first_func_combo is not None:
             from sandbox.anti_hack import dual_execution_check_with_ref, gpu_profiling_check
-            ah_func, ah_kwargs = first_func_combo
+            # Preserve the original checks when every case returns None.
+            ah_func, ah_kwargs = measured_func_combo or first_func_combo
+            normal_output = measured_normal_output
             hack_detected = False
             hack_reason = ""
             # Layer 2: optimized — reuse already-computed normal output from accuracy test
-            if first_normal_output is not None:
+            if normal_output is not None:
                 try:
-                    is_hack, reason = dual_execution_check_with_ref(ah_func, ah_kwargs, first_normal_output)
+                    is_hack, reason = dual_execution_check_with_ref(ah_func, ah_kwargs, normal_output)
                     if is_hack:
                         hack_detected, hack_reason = True, reason
                 except Exception as e:
@@ -823,6 +831,7 @@ class Verifier:
             if hack_detected:
                 failed = total
                 tb_str = f"[Anti-hack] {hack_reason}"
+                first_failure_traceback = tb_str
                 logger.warning(f"Anti-hack detected for {report_name}: {hack_reason}")
 
         log_flag = "[Fail]" if failed > 0 else "[Success]"
