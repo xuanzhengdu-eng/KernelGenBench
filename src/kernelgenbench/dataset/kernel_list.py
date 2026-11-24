@@ -535,6 +535,9 @@ def is_pytorch_op(api: str, namespace: str = "") -> bool:
     """Return True if api is a registered PyTorch operator in IMPL_INFO."""
     if namespace:
         return False
+    # Preserve the full non-ATen name for baseline lookup and test selection.
+    if "::" in api and api.split("::", 1)[0] != "aten":
+        return False
     return api in IMPL_INFO
 
 # ============ MM Shape-Specific Benchmark ============
