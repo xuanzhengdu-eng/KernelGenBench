@@ -85,7 +85,9 @@ def test_guard_preserves_explicit_backward_value(monkeypatch):
 def test_completed_cases_survive_interruption_without_old_progress(tmp_path, monkeypatch):
     report = tmp_path / "report.json"
     partial = tmp_path / "report.json.partial.jsonl"
+    started = tmp_path / "report.json.started.jsonl"
     partial.write_text('{"stale": true}\n', encoding="utf-8")
+    started.write_text('{"stale": true}\n', encoding="utf-8")
 
     def first_case():
         pass
@@ -105,6 +107,11 @@ def test_completed_cases_survive_interruption_without_old_progress(tmp_path, mon
     cases = [json.loads(line) for line in partial.read_text(encoding="utf-8").splitlines()]
     assert cases == [
         {"function": "first_case", "params": {}, "success": True, "traceback": None}
+    ]
+    started_cases = [json.loads(line) for line in started.read_text(encoding="utf-8").splitlines()]
+    assert started_cases == [
+        {"function": "first_case", "params": {}},
+        {"function": "interrupted_case", "params": {}},
     ]
     assert not report.exists()
 
@@ -137,6 +144,8 @@ def test_temporary_partial_file_is_removed_after_success():
         paths.append(json_path)
         with open(json_path + ".partial.jsonl", "w", encoding="utf-8") as partial:
             partial.write('{"success": true}\n')
+        with open(json_path + ".started.jsonl", "w", encoding="utf-8") as started:
+            started.write('{"function": "example"}\n')
         return expected_result
 
     runner = SimpleNamespace(run_tests=run_tests)
@@ -144,3 +153,4 @@ def test_temporary_partial_file_is_removed_after_success():
     assert verifier_module.Verifier.run_test(runner, "example", config) is expected_result
     assert not verifier_module.os.path.exists(paths[0])
     assert not verifier_module.os.path.exists(paths[0] + ".partial.jsonl")
+    assert not verifier_module.os.path.exists(paths[0] + ".started.jsonl")

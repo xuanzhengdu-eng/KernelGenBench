@@ -217,8 +217,11 @@ class Verifier:
         - If it is a file path (ending in .py or containing a path separator), load from file.
         - Otherwise treat as a module name and import.
         """
+        import hashlib
         import sys
         import importlib.util
+        from pathlib import Path
+        from types import ModuleType
 
         # Check if it is a directory
         if os.path.isdir(module_or_path):
@@ -235,17 +238,67 @@ class Verifier:
             if not os.path.exists(module_or_path):
                 raise FileNotFoundError(f"Module file not found: {module_or_path}")
             
-            # Generate module name (extracted from filename)
-            module_name = os.path.splitext(os.path.basename(module_or_path))[0]
-            
-            # Use importlib.util to load from file
-            spec = importlib.util.spec_from_file_location(module_name, module_or_path)
+            path = Path(module_or_path).resolve()
+            parts = [path.stem]
+            parent = path.parent
+            while (parent / "__init__.py").is_file():
+                parts.insert(0, parent.name)
+                parent = parent.parent
+            roots = {
+                os.path.normcase(os.path.realpath(entry or os.getcwd()))
+                for entry in sys.path if isinstance(entry, str)
+            }
+            package_module = (
+                len(parts) > 1
+                and all(part.isidentifier() for part in parts)
+                and os.path.normcase(str(parent)) in roots
+            )
+            if package_module:
+                module_name = ".".join(parts)
+            else:
+                # Independent files can share a basename; use their full path
+                # to generate a stable, collision-resistant module name.
+                digest = hashlib.sha256(os.fsencode(path)).hexdigest()
+                module_name = f"_kernelgenbench_test_{digest}"
+
+            target_file = os.path.normcase(str(path))
+            loaded = sys.modules.get(module_name)
+            if loaded is not None:
+                loaded_file = getattr(loaded, "__file__", None)
+                if not loaded_file or os.path.normcase(os.path.realpath(loaded_file)) != target_file:
+                    raise ImportError(f"Module {module_name} resolved to a different file: {loaded_file}")
+                return
+
+            # A file can already be loaded under an alias. Importing it again
+            # would re-run its decorators and register the same slots twice.
+            for loaded in tuple(sys.modules.values()):
+                if not isinstance(loaded, ModuleType):
+                    continue
+                loaded_file = loaded.__dict__.get("__file__")
+                if isinstance(loaded_file, str):
+                    if os.path.normcase(os.path.realpath(loaded_file)) == target_file:
+                        logger.info(f"Test module already loaded from file: {path}")
+                        return
+
+            if package_module:
+                module = importlib.import_module(module_name)
+                loaded_file = getattr(module, "__file__", None)
+                if not loaded_file or os.path.normcase(os.path.realpath(loaded_file)) != target_file:
+                    raise ImportError(f"Module {module_name} resolved to a different file: {loaded_file}")
+                logger.info(f"Imported test module: {module_name}")
+                return
+
+            spec = importlib.util.spec_from_file_location(module_name, path)
             if spec is None or spec.loader is None:
                 raise ImportError(f"Cannot load module from {module_or_path}")
             
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
-            spec.loader.exec_module(module)
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(module_name, None)
+                raise
             logger.info(f"Loaded module from file: {module_or_path}")
         else:
             # Handle as module name
@@ -540,16 +593,37 @@ class Verifier:
             filtered = [(f, m) for f, m in funcs if prefix in f.__module__]
             if filtered:
                 funcs = filtered
+        # A caller may have imported a test file under multiple module names
+        # before the verifier ran. Execute each source definition only once;
+        # keep distinct definitions, including same-named ones in one file.
+        unique_funcs = []
+        seen = set()
+        for func, mark in funcs:
+            code = getattr(func, "__code__", None)
+            if code and os.path.isfile(code.co_filename):
+                identity = (os.path.realpath(code.co_filename), code.co_firstlineno, func.__qualname__, mark)
+            else:
+                identity = (id(func), mark)
+            if identity not in seen:
+                seen.add(identity)
+                unique_funcs.append((func, mark))
+        funcs = unique_funcs
         print(funcs)
         results = []
         partial_path = f"{json_path}.partial.jsonl" if json_path else None
-        if partial_path:
+        started_path = f"{json_path}.started.jsonl" if json_path else None
+        for progress_path in (partial_path, started_path):
+            if not progress_path:
+                continue
             try:
-                with open(partial_path, "w", encoding="utf-8"):
+                with open(progress_path, "w", encoding="utf-8"):
                     pass
             except OSError as exc:
-                logger.warning("Could not initialize partial test results: %s", exc)
-                partial_path = None
+                logger.warning("Could not initialize test progress %s: %s", progress_path, exc)
+                if progress_path == partial_path:
+                    partial_path = None
+                else:
+                    started_path = None
         speedup = None
         first_failure_traceback = None  # Store first failure traceback for reporting
         first_func_combo = None
@@ -560,7 +634,7 @@ class Verifier:
                 logger.info(f"Fail Test function {func_name} not found")
                 console.print(f"[red][bold]Fail[/bold][/red] Test function {func_name} not found")
                 return VerifyResult(op_name=report_name, success=False, traceback=f"Test function {func_name} not found")
-            params = get_params(func_name, mark)
+            params = get_params(func, mark)
             for combo in ([{}] if not params else expand_params(params)):
                 total += 1
                 success = True
@@ -576,6 +650,14 @@ class Verifier:
                 except Exception as e:
                     print(combo)
                     raise e
+                if started_path:
+                    started = {"function": func_name, "params": recorded_params}
+                    try:
+                        with open(started_path, "a", encoding="utf-8") as started_file:
+                            started_file.write(json.dumps(started, default=default_converter) + "\n")
+                    except OSError as exc:
+                        logger.warning("Could not save test start: %s", exc)
+                        started_path = None
                 try:
                     ret = func(**combo)
                     if first_normal_output is None:
@@ -768,10 +850,11 @@ class Verifier:
 
         if delete_after:
             os.remove(json_path)
-            try:
-                os.remove(json_path + ".partial.jsonl")
-            except FileNotFoundError:
-                pass
+            for suffix in (".partial.jsonl", ".started.jsonl"):
+                try:
+                    os.remove(json_path + suffix)
+                except FileNotFoundError:
+                    pass
         return verifyresult
     
     def _verify(

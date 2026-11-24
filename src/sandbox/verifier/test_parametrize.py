@@ -64,6 +64,7 @@ def get_all_labels():
 
 
 _parameter_registry = {}
+_function_parameter_registry = {}
 
 class Param:
     def __init__(self, *values, marks: str | list[str] = None):
@@ -78,6 +79,11 @@ def parametrize(param_names, values):
         name = func.__name__
         if name not in _parameter_registry:
             _parameter_registry[name] = {}
+        function_params = _function_parameter_registry.setdefault(func, {})
+
+        def register_slot(mark, slot):
+            _parameter_registry[name].setdefault(mark, []).append(slot)
+            function_params.setdefault(mark, []).append(slot)
 
         if isinstance(param_names, str):
             param_names_list = [p.strip() for p in param_names.split(",")]
@@ -87,12 +93,7 @@ def parametrize(param_names, values):
         if isinstance(values[0], Param):
             for param in values:
                 for mark in param.marks:
-                    _parameter_registry[name].setdefault(mark, []).append(
-                        {
-                            "names": param_names_list,
-                            "values": param.values
-                        }
-                    )
+                    register_slot(mark, {"names": param_names_list, "values": param.values})
                     _label_registry.setdefault(mark, []).append((func, mark))
         else:
             # slot: a set of parameter names and corresponding values
@@ -100,7 +101,7 @@ def parametrize(param_names, values):
             #     "names": param_names_list,
             #     "values": values
             # })
-            _parameter_registry[name].setdefault("default", []).append({
+            register_slot("default", {
                 "names": param_names_list,
                 "values": values
             })
@@ -112,4 +113,6 @@ def get_registry():
     return _parameter_registry
 
 def get_params(name, mark="default"):
+    if callable(name):
+        return _function_parameter_registry.get(name, {}).get(mark, {})
     return _parameter_registry.get(name, {}).get(mark, {})
