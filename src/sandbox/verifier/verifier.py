@@ -18,6 +18,7 @@ from sandbox.register_scanner import auto_register_module
 from sandbox.verifier.test_parametrize import get_funcs_by_label, _label_registry, get_params
 from fastapi.encoders import jsonable_encoder
 import os
+import signal
 DISPATCH_TORCH_LIB = os.environ.get("DISPATCH_TORCH_LIB", "1") == "1"
 from tqdm import tqdm
 import traceback
@@ -79,6 +80,39 @@ class VerifyRequest:
     source: List[Source]
     test_func: List[str | None] | None = None
     test_func_mark: str | None = None
+
+
+def _run_verify_in_session(target, verifyrequest, result_queue):
+    """Keep a verification and compiler subprocesses in their own session."""
+    if os.name == "posix":
+        os.setsid()
+    target(verifyrequest=verifyrequest, result_queue=result_queue)
+
+
+def _terminate_verify_process(process):
+    """Stop a timed-out verifier and descendants without touching other jobs."""
+    pid = process.pid
+    isolated = False
+    if os.name == "posix" and pid is not None:
+        try:
+            isolated = os.getpgid(pid) == pid and os.getsid(pid) == pid
+        except ProcessLookupError:
+            pass
+    if isolated:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        process.join(timeout=2)
+        # A compiler may ignore SIGTERM or outlive its Python parent.
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.join()
+    else:
+        process.terminate()
+        process.join()
 
 import logging
 from .utils import CustomRichHandler, generate_speedup_html
@@ -501,16 +535,15 @@ class Verifier:
             os.environ[get_visible_devices_env()] = str(device_id)
         ctx = mp.get_context("spawn")
         for verifyrequest in task_collections:
-            p  = ctx.Process(target=self._verify, kwargs={
-                "verifyrequest": verifyrequest, 
-                "result_queue": result_queue,
-            })
+            p = ctx.Process(
+                target=_run_verify_in_session,
+                args=(self._verify, verifyrequest, result_queue),
+            )
             p.start()
             p.join(timeout=self.config.acc_timeout)
             if p.is_alive():
                 logger.error(f"TimeoutError: Test for {verifyrequest.source[0].function_name} timed out after {self.config.acc_timeout}s.")
-                p.terminate()
-                p.join()
+                _terminate_verify_process(p)
                 result_queue.put(VerifyResult(
                     op_name=verifyrequest.source[0].function_name,
                     success=False,

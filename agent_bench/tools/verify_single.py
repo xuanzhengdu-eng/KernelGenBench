@@ -59,6 +59,51 @@ DEFAULT_TEST_MODULES = {
 }
 
 
+def _read_partial_progress(log_dir: Path, full_name: str) -> dict:
+    """Report completed cases on timeout without treating them as a full suite."""
+    mark = full_name.split(".")[-1]
+    report = log_dir / f"test_report_{mark}.json"
+    progress = {"timed_out": True, "partial_results_available": False}
+    partial = Path(f"{report}.partial.jsonl")
+    started = Path(f"{report}.started.jsonl")
+    if partial.is_file():
+        completed = passed = failed = 0
+        try:
+            with partial.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # A killed writer may leave a truncated final line.
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("success") is True:
+                        passed += 1
+                    elif row.get("success") is False:
+                        failed += 1
+                    else:
+                        continue
+                    completed += 1
+            progress.update(partial_results_available=True, completed_tests=completed,
+                            completed_passed_tests=passed, completed_failed_tests=failed)
+        except OSError:
+            pass
+    if started.is_file():
+        try:
+            last = None
+            with started.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        last = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+            if last is not None:
+                progress["last_started_test"] = last
+        except OSError:
+            pass
+    return progress
+
+
 def get_test_module(dataset: str, config: dict = None) -> str:
     """Get test module path for dataset.
 
@@ -263,6 +308,8 @@ def verify_single_kernel(
                 # Verifier creates logs under run_dir/run_name/log_0/
                 # run_name is "verify", so logs are at run_dir/verify/log_0/
                 log_dir = Path(run_dir) / "verify" / "log_0"
+                if "TimeoutError: Test timed out" in (result_dict.get("error") or ""):
+                    result_dict.update(_read_partial_progress(log_dir, full_name))
                 if log_dir.exists():
                     result_dict["log_dir"] = str(log_dir)
 
