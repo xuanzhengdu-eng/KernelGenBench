@@ -34,15 +34,13 @@ def test_accuracy_rotary_embedding(shape_pair, num_heads, head_size, dtype, key_
     # Create positions tensor (indices into cos_sin_cache)
     positions = torch.randint(low=0, high=cache_len, size=(seq_len,), dtype=torch.long, device='cuda')
 
-    # Build cos/sin cache: shape [cache_len, 2, head_size]
-    # Standard RoPE cache with base=10000, repeated along last dim to match head_size
-    half = head_size // 2
+    # vLLM's rotary_embedding expects [cache_len, rotary_dim], with the
+    # first half containing cosines and the second half containing sines.
+    # A [cache_len, 2, head_size] tensor is interpreted as rotary_dim=2.
     inv_freq = 1.0 / (10000 ** (torch.arange(0, head_size, 2, device='cuda', dtype=torch.float32) / head_size))
     t = torch.arange(cache_len, device='cuda', dtype=torch.float32).unsqueeze(1)  # [cache_len, 1]
     freqs = t * inv_freq  # [cache_len, half]
-    cos = torch.cos(freqs).repeat_interleave(2, dim=-1)  # [cache_len, head_size]
-    sin = torch.sin(freqs).repeat_interleave(2, dim=-1)  # [cache_len, head_size]
-    cos_sin_cache = torch.stack([cos, sin], dim=1).to(dtype=dtype)  # [cache_len, 2, head_size]
+    cos_sin_cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1).to(dtype=dtype)
 
     # Create inputs
     q0 = torch.randn(seq_len, num_heads, head_size, device='cuda', dtype=dtype)
@@ -73,9 +71,7 @@ def test_accuracy_rotary_embedding(shape_pair, num_heads, head_size, dtype, key_
     positions_bench = torch.randint(low=0, high=cache_len, size=(seq_len,), dtype=torch.long, device='cuda')
     # Reuse the same cos_sin_cache structure but allocate fresh to avoid potential caching artifacts
     freqs_b = torch.arange(cache_len, device='cuda', dtype=torch.float32).unsqueeze(1) * inv_freq
-    cos_b = torch.cos(freqs_b).repeat_interleave(2, dim=-1)
-    sin_b = torch.sin(freqs_b).repeat_interleave(2, dim=-1)
-    cos_sin_cache_bench = torch.stack([cos_b, sin_b], dim=1).to(dtype=dtype)
+    cos_sin_cache_bench = torch.cat([torch.cos(freqs_b), torch.sin(freqs_b)], dim=-1).to(dtype=dtype)
 
     q0_b = torch.randn(seq_len, num_heads, head_size, device='cuda', dtype=dtype)
     k0_b = None if key_is_none else torch.randn(seq_len, num_heads, head_size, device='cuda', dtype=dtype)
