@@ -31,6 +31,7 @@ import importlib
 from pydantic import BaseModel
 from copy import deepcopy
 from dataclasses import dataclass, asdict
+from contextlib import contextmanager
 class BenchmarkResult:
     """Stub: legacy benchmark result type, no longer used."""
     pass
@@ -128,6 +129,43 @@ def get_name_list_from_code_dir(code_dir: str) -> List[str]:
             name = file[len("problem_"):].split("_sample_")[0]
             name_list.append(name)
     return name_list
+
+
+@contextmanager
+def candidate_registration_guard(expected_key):
+    """Keep the official baseline and allow idempotent candidate registration."""
+    import importlib
+    import kernelgenbench
+
+    module = importlib.import_module("sandbox.register")
+    original_module_register = module.register
+    original_public_register = kernelgenbench.register
+
+    def wrap(original_register):
+        def guarded(api, key, has_backward=module.Autograd.enable, namespace=""):
+            existing = module.REGISTERED_OPS.get(namespace, {}).get(key) if namespace else None
+            if key == expected_key and existing is not None and namespace == "baseline":
+                logger.warning(
+                    "Ignoring candidate baseline registration for %s; retaining official baseline", key
+                )
+                return lambda fn: fn
+            if key == expected_key and existing is not None and namespace == "triton":
+                def already_registered(fn):
+                    if existing[1] is fn:
+                        logger.info("Ignoring idempotent candidate registration for %s", key)
+                        return fn
+                    raise ValueError(f"Conflicting candidate registration for {key}")
+                return already_registered
+            return original_register(api, key, has_backward=has_backward, namespace=namespace)
+        return guarded
+
+    module.register = wrap(original_module_register)
+    kernelgenbench.register = wrap(original_public_register)
+    try:
+        yield
+    finally:
+        module.register = original_module_register
+        kernelgenbench.register = original_public_register
 
 
 class Verifier:
@@ -384,7 +422,11 @@ class Verifier:
                 tmp.write(code)
                 triton_code_paths = tmp.name
                 logger.info(f"save triton code to {triton_code_paths}")
-        auto_register_module(triton_code_paths)
+        if namespace == "triton":
+            with candidate_registration_guard(name):
+                auto_register_module(triton_code_paths)
+        else:
+            auto_register_module(triton_code_paths)
         return triton_code_paths
 
     def only_verify(
@@ -500,6 +542,14 @@ class Verifier:
                 funcs = filtered
         print(funcs)
         results = []
+        partial_path = f"{json_path}.partial.jsonl" if json_path else None
+        if partial_path:
+            try:
+                with open(partial_path, "w", encoding="utf-8"):
+                    pass
+            except OSError as exc:
+                logger.warning("Could not initialize partial test results: %s", exc)
+                partial_path = None
         speedup = None
         first_failure_traceback = None  # Store first failure traceback for reporting
         first_func_combo = None
@@ -578,6 +628,20 @@ class Verifier:
                         "success": success,
                         "traceback": tb_str,
                     })
+                if partial_path:
+                    # A completed case remains available if a later case times out.
+                    partial = {
+                        "function": func_name,
+                        "params": recorded_params,
+                        "success": success,
+                        "traceback": tb_str,
+                    }
+                    try:
+                        with open(partial_path, "a", encoding="utf-8") as partial_file:
+                            partial_file.write(json.dumps(partial, default=default_converter) + "\n")
+                    except OSError as exc:
+                        logger.warning("Could not save partial test results: %s", exc)
+                        partial_path = None
                 if not success:
                     if first_failure_traceback is None:
                         first_failure_traceback = tb_str  # Save first failure traceback
@@ -704,6 +768,10 @@ class Verifier:
 
         if delete_after:
             os.remove(json_path)
+            try:
+                os.remove(json_path + ".partial.jsonl")
+            except FileNotFoundError:
+                pass
         return verifyresult
     
     def _verify(
