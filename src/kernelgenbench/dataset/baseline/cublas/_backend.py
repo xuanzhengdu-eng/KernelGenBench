@@ -48,12 +48,31 @@ def get_blas_lib():
 # ---------------------------------------------------------------------------
 
 _handle = None
+_stream_fn = None
+
+
+def _bind_current_cuda_stream(handle, backend):
+    """Keep cuBLAS work ordered with PyTorch work on its current CUDA stream."""
+    if backend.vendor.value != "nvidia":
+        return
+    import torch
+
+    global _stream_fn
+    if _stream_fn is None:
+        _stream_fn = getattr(get_blas_lib(), "cublasSetStream_v2")
+        _stream_fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _stream_fn.restype = ctypes.c_int
+    stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+    status = _stream_fn(handle, stream)
+    if status != 0:
+        raise RuntimeError(f"cuBLAS SetStream failed with status {status}")
 
 
 def get_or_create_handle():
     """Get or create a global BLAS handle (reused across calls)."""
     global _handle
     if _handle is not None:
+        _bind_current_cuda_stream(_handle, get_backend())
         return _handle
 
     lib = get_blas_lib()
@@ -78,6 +97,7 @@ def get_or_create_handle():
     if status != 0:
         raise RuntimeError(f"BLAS SetPointerMode failed with status {status}")
 
+    _bind_current_cuda_stream(_handle, backend)
     return _handle
 
 
