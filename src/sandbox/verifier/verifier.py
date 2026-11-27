@@ -596,7 +596,10 @@ class Verifier:
                     }
                     speedup.append(avg_speed)
 
-            if not success:
+            # In all-failures mode, keep running the remaining test functions;
+            # otherwise a failure in the final parameter combination of one
+            # function silently drops the rest of the operator's coverage.
+            if not success and max_failures != "all":
                 break
         if total == 0:
             logger.warning(f"[\033[91mFail\033[0m] No valid test cases found for {name}")
