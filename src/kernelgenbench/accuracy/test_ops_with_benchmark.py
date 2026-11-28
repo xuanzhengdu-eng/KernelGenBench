@@ -11436,6 +11436,12 @@ def test_accuracy_zeros(shape, dtype):
 
 
 
+# The historical tests live in separate modules, but existing verifier entry
+# points load this ATen module explicitly. Importing them here preserves those
+# entry points and registers the recovered labels through the normal registry.
+from kernelgenbench.accuracy import recovered_pointwise, recovered_views, recovered_complex
+
+
 # ========== zeros_like ==========
 @label("zeros_like")
 @parametrize("shape", POINTWISE_SHAPES)
