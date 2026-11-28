@@ -26,8 +26,15 @@ python scripts/h20_reference_check.py --output /path/to/new-results \
 
 # In the separate vLLM 0.13 environment, after the GPU becomes available:
 python scripts/h20_reference_check.py --output /path/to/new-vllm-results \
-  --category vllm13 --timeout 1800
+  --category vllm13 --vllm-default-stream --timeout 1800
 ```
+
+`--vllm-default-stream` is an explicit compatibility mode for the vLLM 0.13
+reference self-check. Some upstream vLLM 0.13 kernels use the CUDA default stream
+instead of PyTorch's current stream; without this option the checker uses its
+original verifier stream and can expose that race. The option does **not** fix
+vLLM's general non-default-stream correctness, and must be recorded with results.
+The runner stores the selected stream mode in its result metadata.
 
 Omit `--category` to select all 210 operators in an environment satisfying all
 requirements, or use `--operator aten::erfc` for one operator. Output directories
@@ -37,6 +44,31 @@ incomplete coverage explicitly. It stops starting new operators if output
 storage falls below 5 GiB. The upstream tests also contain performance loops;
 those loops still execute and the full run may take a long time. Ref-versus-ref
 performance numbers are diagnostic noise and must not be presented as speedups.
+
+## Optional SM90 AllSpark reference adapter
+
+The stock vLLM 0.13 wheel does not contain the required SM90 AllSpark GEMM and
+weight-repack kernels. A separately built, private extension can be enabled for
+this benchmark without replacing vLLM's global operators. In a compatible
+PyTorch 2.9.0 / CUDA 12.9 environment, obtain the official PyPI
+`vllm-0.13.0.tar.gz` and run:
+
+```bash
+python scripts/build_h20_allspark.py --source-archive /path/to/vllm-0.13.0.tar.gz \
+  --output /path/to/new-allspark-build
+export KERNELGENBENCH_H20_ALLSPARK_LIBRARY=/path/to/new-allspark-build/build/kg_allspark_h20.so
+python scripts/validate_h20_allspark.py
+python scripts/h20_reference_check.py --output /path/to/new-allspark-results \
+  --operator vllm13::allspark_w8a16_gemm --vllm-default-stream
+```
+
+The builder verifies the pinned official source SHA256, compiles only `sm_90`,
+and stores the extension and build metadata under the new output directory.
+The adapter checks device capability and is opt-in; without the environment
+variable the original vLLM baseline remains unchanged. It uses an isolated
+operator namespace and per-invocation workspace. This is a benchmark reference
+adapter, not a modification to a running vLLM installation; validate your own
+hardware and runtime versions before use.
 
 For a Docker container exposing only physical GPU 6, CUDA typically sees that
 device as `cuda:0`; pass `--gpus device=6` to Docker and set

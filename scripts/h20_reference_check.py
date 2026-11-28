@@ -5,6 +5,7 @@ This is an environment/coverage diagnostic, not an independent correctness or
 performance benchmark. One subprocess per operator isolates CUDA errors.
 """
 import argparse
+from contextlib import nullcontext
 import importlib
 import json
 import os
@@ -19,7 +20,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 os.environ['DISPATCH_TORCH_LIB'] = '0'
 
 
-def worker(op, directory):
+def worker(op, directory, vllm_default_stream=False):
     import torch
     import kernelgenbench
     from sandbox.verifier import Verifier, VerifyConfig
@@ -50,9 +51,16 @@ def worker(op, directory):
                    for f, mark in funcs)
     print('device:', torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), flush=True)
     print('registered functions:', len(funcs), 'expected cases:', expected, flush=True)
-    result = verifier.run_tests(op, json_path=str(directory / 'cases.json'),
-                                max_failures='all', seed=42, strict_check=True)
+    # vLLM 0.13 has operations that launch on the CUDA default stream even
+    # when PyTorch's current stream is non-default. Opt in only for this
+    # reference self-check; this does not repair general multi-stream support.
+    use_default = category == 'vllm13' and vllm_default_stream
+    stream_context = torch.cuda.stream(torch.cuda.default_stream()) if use_default else nullcontext()
+    with stream_context:
+        result = verifier.run_tests(op, json_path=str(directory / 'cases.json'),
+                                    max_failures='all', seed=42, strict_check=True)
     data = result.model_dump() if hasattr(result, 'model_dump') else result.dict()
+    data['stream_mode'] = 'cuda_default' if use_default else 'verifier_current'
     data['expected_cases'] = expected
     data['registered_functions'] = len(funcs)
     actual = (data.get('info') or {}).get('total', 0)
@@ -71,12 +79,15 @@ def main():
     parser.add_argument('--category', action='append', choices=['aten', 'cublas', 'vllm13'],
                         help='Run only the specified categories; may be repeated')
     parser.add_argument('--timeout', type=int, default=1800, help='Seconds per operator')
+    parser.add_argument('--vllm-default-stream', action='store_true',
+                        help='Run vLLM reference self-check on the CUDA default stream; '
+                             'does not establish general non-default-stream support')
     parser.add_argument('--worker', help=argparse.SUPPRESS)
     args = parser.parse_args()
     out = Path(args.output).resolve()
     if args.worker:
         try:
-            result = worker(args.worker, out)
+            result = worker(args.worker, out, args.vllm_default_stream)
             (out / 'result.json').write_text(json.dumps(result, indent=2, default=str))
         except Exception:
             (out / 'result.json').write_text(json.dumps({'op_name': args.worker, 'success': False,
@@ -98,7 +109,8 @@ def main():
         parser.error('Duplicate operators')
     out.mkdir(parents=True, exist_ok=False)
     metadata = {'operators': ops, 'device_visibility': os.environ.get('CUDA_VISIBLE_DEVICES'),
-                'timeout_seconds': args.timeout, 'note': 'ref vs ref; not independent validation or performance'}
+                'timeout_seconds': args.timeout, 'vllm_default_stream': args.vllm_default_stream,
+                'note': 'ref vs ref; not independent validation or performance'}
     (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
     results = []
     for index, op in enumerate(ops, 1):
@@ -109,6 +121,8 @@ def main():
         op_dir = out / op.replace('::', '__')
         op_dir.mkdir()
         command = [sys.executable, str(Path(__file__).resolve()), '--worker', op, '--output', str(op_dir)]
+        if args.vllm_default_stream:
+            command.append('--vllm-default-stream')
         print(f'[{index}/{len(ops)}] {op}', flush=True)
         with (op_dir / 'worker.log').open('w') as log:
             try:

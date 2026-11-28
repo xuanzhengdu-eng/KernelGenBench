@@ -21,7 +21,7 @@ This project includes the following third-party components under their respectiv
 - **Source**: https://github.com/vllm-project/vllm
 - **License**: Apache-2.0
 - **Copyright**: (c) vLLM Team
-- **Description**: High-throughput LLM serving engine — source of the vllm sub-dataset operators
+- **Description**: High-throughput LLM serving engine — source of the vllm sub-dataset operators. The optional H20 AllSpark builder extracts and minimally adapts vLLM 0.13.0 source files from the pinned official source archive; those files remain under Apache-2.0.
 
 ## AutoKernel
 

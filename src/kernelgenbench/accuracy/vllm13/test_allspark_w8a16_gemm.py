@@ -19,10 +19,7 @@ from sandbox.utils.accuracy_utils import kernelgenbench_assert_close as assert_c
 from sandbox.utils.accuracy_utils import CustomBenchmarkResult
 import torch
 import triton
-try:
-    from vllm import _custom_ops
-except ModuleNotFoundError:
-    _custom_ops = None
+from kernelgenbench.runtime.h20_allspark import allspark_repack_weight
 
 @label("allspark_w8a16_gemm")
 @parametrize("config", [
@@ -49,14 +46,23 @@ def test_accuracy_allspark_w8a16_gemm(config):
     qweight = torch.randint(0, 255, (K, N), device=device, dtype=torch.uint8)
     scale = torch.randn(1, N, device=device, dtype=torch.float16)
 
-    rw, rs, _ = _custom_ops.allspark_repack_weight(qweight, scale)
+    props = torch.cuda.get_device_properties(a.device)
+    sm_count = props.multi_processor_count
+    sm_version = props.major * 10 + props.minor
+    rw, rs, _ = allspark_repack_weight(qweight, scale)
 
     ref_out = kernelgenbench.baseline.allspark_w8a16_gemm(
-        a, rw, rs, None, N, -1, 108, 80, 16, False, True)
+        a, rw, rs, None, N, -1, sm_count, sm_version, 16, False, True)
     act_out = kernelgenbench.triton.allspark_w8a16_gemm(
-        a, rw, rs, None, N, -1, 108, 80, 16, False, True)
+        a, rw, rs, None, N, -1, sm_count, sm_version, 16, False, True)
 
     assert_close(act_out, ref_out, torch.float16)
+    # Independent mathematical reference for uint8-biased per-channel W8A16.
+    oracle = torch.matmul(a, (qweight.to(torch.float16) - 128) * scale)
+    denominator = oracle.float().abs().mean().clamp_min(1e-12)
+    for name, result in [('reference', ref_out), ('candidate', act_out)]:
+        error = (result.float() - oracle.float()).abs().mean() / denominator
+        assert torch.isfinite(error) and error < 0.04, f'{name} normalized error: {error}'
 
     # ===== Performance Test =====
     if M < 256 or K < 512 or N < 256:
@@ -65,17 +71,17 @@ def test_accuracy_allspark_w8a16_gemm(config):
     a_bench = torch.randn(M, K, device=device, dtype=torch.float16)
     qweight_bench = torch.randint(0, 255, (K, N), device=device, dtype=torch.uint8)
     scale_bench = torch.randn(1, N, device=device, dtype=torch.float16)
-    rw_bench, rs_bench, _ = _custom_ops.allspark_repack_weight(qweight_bench, scale_bench)
+    rw_bench, rs_bench, _ = allspark_repack_weight(qweight_bench, scale_bench)
 
     ms_baseline = triton.testing.do_bench(
         lambda: kernelgenbench.baseline.allspark_w8a16_gemm(
-            a_bench, rw_bench, rs_bench, None, N, -1, 108, 80, 16, False, True),
+            a_bench, rw_bench, rs_bench, None, N, -1, sm_count, sm_version, 16, False, True),
         warmup=25, rep=100
     )
 
     ms_triton = triton.testing.do_bench(
         lambda: kernelgenbench.triton.allspark_w8a16_gemm(
-            a_bench, rw_bench, rs_bench, None, N, -1, 108, 80, 16, False, True),
+            a_bench, rw_bench, rs_bench, None, N, -1, sm_count, sm_version, 16, False, True),
         warmup=25, rep=100
     )
 

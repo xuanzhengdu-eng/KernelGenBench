@@ -279,30 +279,16 @@ def gen_cat_shapes_dim(shapes):
     return results
 
 def gen_indices(input_shape, indices_shape, accumulate):
-    """
-    Generate indices for torch.ops.aten.index.
-    All index tensors must be broadcastable, so we ensure they have compatible shapes.
-    """
+    """Generate broadcastable integer indices with the specified shapes."""
+    shapes = [(shape,) if isinstance(shape, int) else tuple(shape) for shape in indices_shape]
+    np.broadcast_shapes(*shapes)
     indices = []
-    if len(indices_shape) > 0:
-        sizes = []
-        for shape in indices_shape:
-            if isinstance(shape, int):
-                sizes.append(shape)
-            elif isinstance(shape, (tuple, list)) and len(shape) > 0:
-                sizes.append(shape[0])
-            else:
-                sizes.append(16)
-        common_size = min(sizes) if sizes else 16
-        for i, shape in enumerate(indices_shape):
-            if isinstance(shape, int):
-                size = min(shape, common_size)
-            elif isinstance(shape, (tuple, list)) and len(shape) > 0:
-                size = min(shape[0], common_size)
-            else:
-                size = common_size
-            index = np.random.choice(np.arange(input_shape[i]), size=size, replace=accumulate)
-            indices.append(torch.tensor(index, device="cuda"))
+    for i, shape in enumerate(shapes):
+        if accumulate:
+            index = np.random.randint(0, input_shape[i], size=shape, dtype=np.int64)
+        else:
+            index = np.random.choice(input_shape[i], size=shape, replace=False)
+        indices.append(torch.as_tensor(index, dtype=torch.long, device=device))
     return indices
 
 def gen_indices_for_index_put(input_shape, indices_shape, accumulate, is_bool):
@@ -316,12 +302,15 @@ def gen_indices_for_index_put(input_shape, indices_shape, accumulate, is_bool):
     indices = []
     if is_bool:
         mask_shape = indices_shape[0]
-        mask = torch.randint(0, 2, size=mask_shape, dtype=torch.bool, device="cuda")
+        mask = torch.randint(0, 2, size=mask_shape, dtype=torch.bool, device=device)
         return [mask]
     else:
         for i, shape in enumerate(indices_shape):
-            index = np.random.choice(np.arange(input_shape[i]), size=shape, replace=accumulate)
-            indices.append(torch.tensor(index, device="cuda"))
+            if accumulate:
+                index = np.random.randint(0, input_shape[i], size=shape, dtype=np.int64)
+            else:
+                index = np.random.choice(input_shape[i], size=shape, replace=False)
+            indices.append(torch.as_tensor(index, dtype=torch.long, device=device))
         return indices
 
 def generate_test_params():
@@ -8073,36 +8062,44 @@ def test_accuracy_bitwisenot(shape, dtype):
 @parametrize("M, N, K", MNK_SHAPES)
 @parametrize("dtype", FLOAT_DTYPES)
 def test_accuracy_bmm(M, N, K, dtype):
-    inp = [
-        torch.randint(low=0, high=0x7FFF, size=s, dtype=dtype, device="cpu").to(
-            device
-        )
-        for s in shape
-    ]
-    ref_inp = [to_reference(_) for _ in inp]
-    ref_out = torch.cat(ref_inp, dim)
+    mat1 = torch.randn((2, M, K), dtype=dtype, device=device)
+    mat2 = torch.randn((2, K, N), dtype=dtype, device=device)
+    ref_mat1 = to_reference(mat1, True)
+    ref_mat2 = to_reference(mat2, True)
+    ref_out = torch.bmm(ref_mat1, ref_mat2)
+    # An independent float64 accumulation avoids using reference self-equality
+    # as the only correctness signal, then rounds to the requested dtype.
+    oracle = torch.bmm(ref_mat1.to(torch.float64), ref_mat2.to(torch.float64)).to(dtype)
+    original_mat1, original_mat2 = mat1.clone(), mat2.clone()
 
     with kernelgenbench.use_ops(REGISTERED_OPS):
-        res_out = torch.cat(inp, dim)
-    kernelgenbench_assert_equal(res_out, ref_out)
+        res_out = torch.bmm(mat1, mat2)
+    assert res_out.shape == (2, M, N) and res_out.dtype == dtype
+    torch.testing.assert_close(mat1, original_mat1, rtol=0, atol=0)
+    torch.testing.assert_close(mat2, original_mat2, rtol=0, atol=0)
+    tolerances = {
+        torch.float32: (1e-5, 1e-4),
+        torch.float16: (1e-3, 2e-3),
+        torch.bfloat16: (1.6e-2, 1.6e-2),
+    }
+    rtol, atol = tolerances[dtype]
+    torch.testing.assert_close(ref_out, oracle, rtol=rtol, atol=atol)
+    torch.testing.assert_close(to_cpu(res_out, oracle), oracle, rtol=rtol, atol=atol)
 
-    # Benchmark: 性能测试
+    # Benchmark the same batched matrix multiplication on both sides.
     import triton
     from sandbox.utils.accuracy_utils import CustomBenchmarkResult
 
     quantiles = [0.5, 0.2, 0.8]
-
-    # PyTorch reference 性能
     ms_torch, _, _ = get_triton_testing().do_bench(
-        lambda: torch.cat([x.clone() for x in ref_inp], dim),
+        lambda: torch.bmm(ref_mat1, ref_mat2),
         rep=100,
         quantiles=quantiles
     )
 
-    # Triton 实现性能
     with kernelgenbench.use_ops(REGISTERED_OPS):
         ms_triton, _, _ = get_triton_testing().do_bench(
-            lambda: torch.cat([x.clone() for x in inp], dim),
+            lambda: torch.bmm(mat1, mat2),
             rep=100,
             quantiles=quantiles
         )
@@ -8584,7 +8581,12 @@ def test_accuracy_cos(shape, dtype):
 @parametrize("shape", CUMSUM_SHAPES)
 @parametrize("dtype", FLOAT_DTYPES + INT_DTYPES)
 def test_accuracy_cumsum(shape, dtype):
-    inp = torch.randn(shape, dtype=dtype, device=device)
+    # Keep the original shape-dependent reduction axis.
+    dim = 1 if shape == REDUCTION_SHAPES[-1] else -1
+    if dtype in INT_DTYPES:
+        inp = torch.randint(-3, 3, shape, dtype=dtype, device=device)
+    else:
+        inp = torch.randn(shape, dtype=dtype, device=device)
     ref_inp = to_reference(inp, True)
 
     ref_out = torch.cumsum(ref_inp, dim=dim)
@@ -8863,22 +8865,23 @@ def test_accuracy_div_scalar_scalar(dtype):
         inp1 = random.randint(1, 100)
         inp2 = random.randint(1, 100)
 
-    ref_out = torch.mul(inp1, inp2)
+    ref_out = torch.div(inp1, inp2)
     with kernelgenbench.use_ops(REGISTERED_OPS):
-        res_out = torch.mul(inp1, inp2)
+        res_out = torch.div(inp1, inp2)
 
+    # True division promotes integer inputs to the default floating dtype.
     if dtype == torch.int64:
         kernelgenbench_assert_equal(res_out, ref_out)
     else:
-        kernelgenbench_assert_close(res_out, ref_out, dtype)
+        kernelgenbench_assert_close(res_out, ref_out, ref_out.dtype)
 
     # Benchmark: 性能测试
     import triton
     from sandbox.utils.accuracy_utils import CustomBenchmarkResult
     quantiles = [0.5, 0.2, 0.8]
-    ms_torch, _, _ = get_triton_testing().do_bench(lambda: torch.mul(inp1, inp2), rep=100, quantiles=quantiles)
+    ms_torch, _, _ = get_triton_testing().do_bench(lambda: torch.div(inp1, inp2), rep=100, quantiles=quantiles)
     with kernelgenbench.use_ops(REGISTERED_OPS):
-        ms_triton, _, _ = get_triton_testing().do_bench(lambda: torch.mul(inp1, inp2), rep=100, quantiles=quantiles)
+        ms_triton, _, _ = get_triton_testing().do_bench(lambda: torch.div(inp1, inp2), rep=100, quantiles=quantiles)
     speedup = ms_torch / ms_triton
     result = CustomBenchmarkResult(ref_time=ms_torch, res_time=ms_triton, speedup=speedup,)
     return result
@@ -8894,23 +8897,22 @@ def test_accuracy_div_scalar_scalar(dtype):
 # Note : tl.math.div_rz only support float32, cast will cause diff
 # with torch, so we only do float32 test for now.
 def test_accuracy_trunc_div(shape, dtype):
-    inp1 = random.randint(1, 100)
-    inp2 = random.randint(1, 100)
+    inp1 = torch.randn(shape, dtype=dtype, device=device)
+    inp2 = torch.rand(shape, dtype=dtype, device=device) + 0.01
+    ref_inp1 = to_reference(inp1, False)
+    ref_inp2 = to_reference(inp2, False)
 
-    ref_out = torch.div(inp1, inp2, rounding_mode="trunc")
+    ref_out = torch.div(ref_inp1, ref_inp2, rounding_mode="trunc")
     with kernelgenbench.use_ops(REGISTERED_OPS):
         res_out = torch.div(inp1, inp2, rounding_mode="trunc")
 
-    if dtype == torch.int64:
-        kernelgenbench_assert_equal(res_out, ref_out)
-    else:
-        kernelgenbench_assert_close(res_out, ref_out, dtype)
+    kernelgenbench_assert_close(res_out, ref_out, dtype)
 
     # Benchmark: 性能测试
     import triton
     from sandbox.utils.accuracy_utils import CustomBenchmarkResult
     quantiles = [0.5, 0.2, 0.8]
-    ms_torch, _, _ = get_triton_testing().do_bench(lambda: torch.div(inp1, inp2, rounding_mode="trunc"), rep=100, quantiles=quantiles)
+    ms_torch, _, _ = get_triton_testing().do_bench(lambda: torch.div(ref_inp1, ref_inp2, rounding_mode="trunc"), rep=100, quantiles=quantiles)
     with kernelgenbench.use_ops(REGISTERED_OPS):
         ms_triton, _, _ = get_triton_testing().do_bench(lambda: torch.div(inp1, inp2, rounding_mode="trunc"), rep=100, quantiles=quantiles)
     speedup = ms_torch / ms_triton
@@ -8936,6 +8938,8 @@ def test_accuracy_div_tensor_tensor_(shape, dtype):
     with kernelgenbench.use_ops(REGISTERED_OPS):
         res_out = inp1.div_(inp2)
 
+    assert res_out is inp1, 'div_ must return the mutated input'
+    kernelgenbench_assert_close(inp1, ref_inp1, dtype, equal_nan=True)
     kernelgenbench_assert_close(res_out, ref_out, dtype, equal_nan=True)
 
     # Benchmark: 性能测试
@@ -8967,6 +8971,8 @@ def test_accuracy_div_tensor_scalar_(shape, scalar, dtype):
     with kernelgenbench.use_ops(REGISTERED_OPS):
         res_out = inp1.div_(inp2)
 
+    assert res_out is inp1, 'div_ must return the mutated input'
+    kernelgenbench_assert_close(inp1, ref_inp1, dtype, equal_nan=True)
     kernelgenbench_assert_close(res_out, ref_out, dtype, equal_nan=True)
 
     # Benchmark: 性能测试
@@ -8992,13 +8998,17 @@ def test_accuracy_div_tensor_scalar_(shape, scalar, dtype):
 # with torch, so we only do float32 test for now.
 def test_accuracy_trunc_div_(shape, dtype):
     upcast = True
-    ref_inp1 = to_reference(inp1, upcast)
+    inp1 = torch.randn(shape, dtype=dtype, device=device)
+    inp2 = torch.randn(shape, dtype=dtype, device=device)
+    ref_inp1 = to_reference(inp1.clone(), upcast)
     ref_inp2 = to_reference(inp2, upcast)
 
     ref_out = ref_inp1.div_(ref_inp2, rounding_mode="trunc")
     with kernelgenbench.use_ops(REGISTERED_OPS):
         res_out = inp1.div_(inp2, rounding_mode="trunc")
 
+    assert res_out is inp1, 'div_ must return the mutated input'
+    kernelgenbench_assert_close(inp1, ref_inp1, dtype, equal_nan=True)
     if not TO_CPU:
         logging.debug(
             f"The maximum difference between torch and triton is "
@@ -9036,22 +9046,49 @@ def test_accuracy_trunc_div_(shape, dtype):
 @parametrize("scale_grad_by_freq", [True, False])
 @parametrize("dtype", FLOAT_DTYPES)
 def test_embedding(EmbeddingSize, Batch, M, N, padding_idx, scale_grad_by_freq, dtype):
-    ref_value_tensor = to_reference(value_tensor)
-    ref_x.fill_(ref_value_tensor)
+    weight = torch.randn((EmbeddingSize, N), dtype=dtype, device=device, requires_grad=True)
+    indices = torch.randint(0, EmbeddingSize, (Batch, M), dtype=torch.long, device=device)
+    # Match torch.nn.functional.embedding: None means no padding, while
+    # negative explicit padding indices are normalized into the vocabulary.
+    if padding_idx is None:
+        aten_padding_idx = -1
+    elif padding_idx < 0:
+        aten_padding_idx = EmbeddingSize + padding_idx
+    else:
+        aten_padding_idx = padding_idx
+    # Force a repeated non-padding index: otherwise scale_grad_by_freq is not
+    # exercised by the gradient even though both values are parameterized.
+    repeated_index = 1 if aten_padding_idx == 0 else 0
+    indices.reshape(-1)[:2] = repeated_index
+    if aten_padding_idx >= 0:
+        indices.reshape(-1)[2] = aten_padding_idx
+    original_weight = weight.detach().clone()
+    original_indices = indices.clone()
+    ref_weight = to_reference(original_weight.clone()).requires_grad_(True)
+    ref_indices = to_reference(indices)
+    ref_out = torch.ops.aten.embedding(ref_weight, ref_indices, aten_padding_idx, scale_grad_by_freq, False)
+    # Exercise nonuniform signed gradients, not only counts from all-ones.
+    ref_out_grad = torch.randn_like(ref_out)
+    ref_grad, = torch.autograd.grad(ref_out, ref_weight, ref_out_grad)
     with kernelgenbench.use_ops(REGISTERED_OPS):
-        x.fill_(value_tensor)
+        res_out = torch.ops.aten.embedding(weight, indices, aten_padding_idx, scale_grad_by_freq, False)
+        res_grad, = torch.autograd.grad(res_out, weight, ref_out_grad.to(weight.device))
 
-    kernelgenbench_assert_equal(x, ref_x)
+    kernelgenbench_assert_equal(res_out, ref_out)
+    kernelgenbench_assert_close(res_grad, ref_grad, dtype)
+    torch.testing.assert_close(weight.detach(), original_weight, rtol=0, atol=0)
+    torch.testing.assert_close(indices, original_indices, rtol=0, atol=0)
+    if aten_padding_idx >= 0:
+        assert torch.count_nonzero(ref_grad[aten_padding_idx]) == 0
+        assert torch.count_nonzero(res_grad[aten_padding_idx]) == 0
 
-    # Benchmark: 性能测试
+    # Benchmark the same embedding operation and parameters.
     import triton
     from sandbox.utils.accuracy_utils import CustomBenchmarkResult
     quantiles = [0.5, 0.2, 0.8]
-    ref_x_bench = to_reference(torch.ones(shape, device=device, dtype=dtype), False)
-    x_bench = torch.ones(shape, device=device, dtype=dtype)
-    ms_torch, _, _ = get_triton_testing().do_bench(lambda: ref_x_bench.clone().fill_(value), rep=100, quantiles=quantiles)
+    ms_torch, _, _ = get_triton_testing().do_bench(lambda: torch.ops.aten.embedding(ref_weight, ref_indices, aten_padding_idx, scale_grad_by_freq, False), rep=100, quantiles=quantiles)
     with kernelgenbench.use_ops(REGISTERED_OPS):
-        ms_triton, _, _ = get_triton_testing().do_bench(lambda: x_bench.clone().fill_(value), rep=100, quantiles=quantiles)
+        ms_triton, _, _ = get_triton_testing().do_bench(lambda: torch.ops.aten.embedding(weight, indices, aten_padding_idx, scale_grad_by_freq, False), rep=100, quantiles=quantiles)
     speedup = ms_torch / ms_triton
     result = CustomBenchmarkResult(ref_time=ms_torch, res_time=ms_triton, speedup=speedup)
     return result
@@ -9361,19 +9398,13 @@ def test_accuracy_index(input_shape, indices_shape, dtype):
     inp = torch.randn(
         input_shape, dtype=dtype, device=device, requires_grad=False
     )
-    try:
-        indices = gen_indices(input_shape, indices_shape, True)
-    except Exception:
-        return
+    indices = gen_indices(input_shape, indices_shape, True)
 
     ref_inp = to_reference(inp)
     ref_indices = [to_reference(index) for index in indices]
-    try:
-        ref_out = torch.ops.aten.index(ref_inp, ref_indices)
-    except (IndexError, RuntimeError) as e:
-        return
-
-    out = torch.ops.aten.index(inp, indices)
+    ref_out = torch.ops.aten.index(ref_inp, ref_indices)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        out = torch.ops.aten.index(inp, indices)
     kernelgenbench_assert_close(out, ref_out, dtype)
 
     # Benchmark: 性能测试
@@ -9414,7 +9445,8 @@ def test_index_with_none_basic_indexing(input_shape, index_pos, dtype):
     ref_inp = to_reference(inp)
     ref_indices = [None if idx is None else to_reference(idx) for idx in indices]
     ref_out = torch.ops.aten.index(ref_inp, ref_indices)
-    out = torch.ops.aten.index(inp, indices)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        out = torch.ops.aten.index(inp, indices)
     kernelgenbench_assert_close(out, ref_out, dtype)
 
     # Benchmark: 性能测试
@@ -9444,7 +9476,8 @@ def test_index_boolean_mask(dtype):
     ref_inp = to_reference(inp)
     ref_indices = [to_reference(mask)]
     ref_out = torch.ops.aten.index(ref_inp, ref_indices)
-    out = torch.ops.aten.index(inp, indices)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        out = torch.ops.aten.index(inp, indices)
     kernelgenbench_assert_close(out, ref_out, dtype)
 
     # Benchmark: 性能测试
@@ -9474,7 +9507,8 @@ def test_index_empty_tensor(dtype):
     ref_inp = to_reference(inp)
     ref_indices = [to_reference(idx), None]
     ref_out = torch.ops.aten.index(ref_inp, ref_indices)
-    out = torch.ops.aten.index(inp, indices)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        out = torch.ops.aten.index(inp, indices)
     kernelgenbench_assert_close(out, ref_out, dtype)
 
     # Benchmark: 性能测试
@@ -9504,7 +9538,8 @@ def test_index_1d_special_case(dtype):
     ref_inp = to_reference(inp)
     ref_indices = [to_reference(idx)]
     ref_out = torch.ops.aten.index(ref_inp, ref_indices)
-    out = torch.ops.aten.index(inp, indices)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        out = torch.ops.aten.index(inp, indices)
     kernelgenbench_assert_close(out, ref_out, dtype)
 
     # Benchmark: 性能测试
@@ -9549,7 +9584,8 @@ def test_index_error_too_many_indices(dtype):
     indices = [idx1, idx2, idx3]  # Too many for 2D tensor
 
     with pytest.raises(IndexError, match="too many indices"):
-        torch.ops.aten.index(inp, indices)
+        with kernelgenbench.use_ops(REGISTERED_OPS):
+            torch.ops.aten.index(inp, indices)
 
 
 
@@ -9579,12 +9615,17 @@ def test_index_put__acc_false(input_shape, indices_shape, values_shape, is_bool,
             values_shape, dtype=dtype, device=device, requires_grad=False
         )
 
-    ref_inp = to_reference(inp)
-    ref_indices = [to_reference(index) for index in indices]
-    ref_values = to_reference(values)
+    ref_inp = to_reference(inp.clone())
+    ref_indices = [to_reference(index.clone()) for index in indices]
+    ref_values = to_reference(values.clone())
     torch.index_put_(ref_inp, ref_indices, ref_values, accumulate)
-    torch.ops.aten.index_put_(inp, indices, values, accumulate)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        result = torch.ops.aten.index_put_(inp, indices, values, accumulate)
+    assert result is inp, 'index_put_ must return the mutated input'
     kernelgenbench_assert_close(inp, ref_inp, dtype)
+    for index, ref_index in zip(indices, ref_indices):
+        kernelgenbench_assert_equal(index, ref_index)
+    kernelgenbench_assert_equal(values, ref_values)
 
     # Benchmark: 性能测试
     import triton
@@ -9612,15 +9653,24 @@ def test_index_put__acc_false(input_shape, indices_shape, values_shape, is_bool,
 @parametrize("dtype", [torch.float16, torch.float32])
 def test_index_put__acc_true(input_shape, indices_shape, values_shape, is_bool, dtype):
     init_seed(0)
-    values = torch.randn(
-        values_shape, dtype=dtype, device=device, requires_grad=False
-    )
+    accumulate = True
+    inp = torch.randn(input_shape, dtype=dtype, device=device, requires_grad=False)
+    indices = gen_indices_for_index_put(input_shape, indices_shape, accumulate, is_bool)
+    if is_bool:
+        values = torch.randn((indices[0].sum().item(),), dtype=dtype, device=device)
+    else:
+        values = torch.randn(values_shape, dtype=dtype, device=device, requires_grad=False)
 
-    ref_inp = to_reference(inp, upcast=True)
-    ref_indices = [to_reference(index) for index in indices]
-    ref_values = to_reference(values, upcast=True)
+    ref_inp = to_reference(inp.clone(), upcast=True)
+    ref_indices = [to_reference(index.clone()) for index in indices]
+    ref_values = to_reference(values.clone(), upcast=True)
     torch.index_put_(ref_inp, ref_indices, ref_values, accumulate)
-    torch.ops.aten.index_put_(inp, indices, values, accumulate)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        result = torch.ops.aten.index_put_(inp, indices, values, accumulate)
+    assert result is inp, 'index_put_ must return the mutated input'
+    for index, ref_index in zip(indices, ref_indices):
+        kernelgenbench_assert_equal(index, ref_index)
+    kernelgenbench_assert_equal(values, ref_values)
     if False and dtype == torch.float16:
         from .accuracy_utils import to_cpu
 
@@ -9643,6 +9693,27 @@ def test_index_put__acc_true(input_shape, indices_shape, values_shape, is_bool, 
     speedup = ms_torch / ms_triton
     result = CustomBenchmarkResult(ref_time=ms_torch, res_time=ms_triton, speedup=speedup)
     return result
+
+
+@label("index_put_")
+@parametrize("dtype", [torch.float32])
+def test_index_put__accumulate_repeated_indices(dtype):
+    """Verify repeated indices actually accumulate, not overwrite."""
+    inp = torch.zeros((5,), dtype=dtype, device=device)
+    ref_inp = inp.clone()
+    indices = [torch.tensor([1, 1, 3, 1], dtype=torch.long, device=device)]
+    values = torch.tensor([0.25, 0.5, -1.0, 2.0], dtype=dtype, device=device)
+    original_indices = indices[0].clone()
+    original_values = values.clone()
+    torch.index_put_(ref_inp, indices, values, accumulate=True)
+    with kernelgenbench.use_ops(REGISTERED_OPS):
+        result = torch.ops.aten.index_put_(inp, indices, values, accumulate=True)
+    assert result is inp, 'index_put_ must return the mutated input'
+    expected = torch.tensor([0.0, 2.75, 0.0, -1.0, 0.0], dtype=dtype, device=device)
+    kernelgenbench_assert_equal(ref_inp, expected)
+    kernelgenbench_assert_equal(inp, expected)
+    kernelgenbench_assert_equal(indices[0], original_indices)
+    kernelgenbench_assert_equal(values, original_values)
 
 
 # Additional test cases for index_put to improve coverage
@@ -10177,7 +10248,11 @@ def test_accuracy_mean_dim(shape, dim, keepdim, dtype):
 @parametrize("dtype", FLOAT_DTYPES)
 @parametrize("b_column_major", [True, False])
 def test_accuracy_mm(M, N, K, dtype, b_column_major):
-    mat2 = torch.randn((K, N), dtype=dtype, device=device)
+    mat1 = torch.randn((M, K), dtype=dtype, device=device)
+    if b_column_major:
+        mat2 = torch.randn((N, K), dtype=dtype, device=device).t()
+    else:
+        mat2 = torch.randn((K, N), dtype=dtype, device=device)
     ref_mat1 = to_reference(mat1, True)
     ref_mat2 = to_reference(mat2, True)
 
@@ -10501,24 +10576,20 @@ def test_accuracy_pow_scalar_tensor(scalar, shape, dtype):
 )
 @parametrize("dtype", FLOAT_DTYPES)
 def test_accuracy_pow_tensor_scalar(scalar, shape, dtype):
-    x = torch.randn(size=shape, dtype=dtype, device=device)
-    y = x.conj()
-    z = y.imag
-    assert z.is_neg()
+    inp = torch.randn(size=shape, dtype=dtype, device=device)
+    ref_inp = to_reference(inp, True)
+    ref_out = torch.pow(ref_inp, scalar)
     with kernelgenbench.use_ops(REGISTERED_OPS):
-        out = z.resolve_neg()
-    assert not out.is_neg()
+        res_out = torch.pow(inp, scalar)
+    kernelgenbench_assert_close(res_out, ref_out, dtype, equal_nan=True)
 
     # Benchmark: 性能测试
     import triton
     from sandbox.utils.accuracy_utils import CustomBenchmarkResult
     quantiles = [0.5, 0.2, 0.8]
-    x_bench = torch.randn(size=shape, dtype=dtype, device=device)
-    y_bench = x_bench.conj()
-    z_bench = y_bench.imag
-    ms_torch, _, _ = get_triton_testing().do_bench(lambda: z_bench.resolve_neg(), rep=100, quantiles=quantiles)
+    ms_torch, _, _ = get_triton_testing().do_bench(lambda: torch.pow(ref_inp, scalar), rep=100, quantiles=quantiles)
     with kernelgenbench.use_ops(REGISTERED_OPS):
-        ms_triton, _, _ = get_triton_testing().do_bench(lambda: z_bench.resolve_neg(), rep=100, quantiles=quantiles)
+        ms_triton, _, _ = get_triton_testing().do_bench(lambda: torch.pow(inp, scalar), rep=100, quantiles=quantiles)
     speedup = ms_torch / ms_triton
     result = CustomBenchmarkResult(ref_time=ms_torch, res_time=ms_triton, speedup=speedup)
     return result

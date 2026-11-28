@@ -35,8 +35,11 @@ def allspark_w8a16_gemm(
     has_zp: bool,
     n32k16_reorder: bool
 ) -> torch.Tensor:
-    """Wrapper for vLLM allspark_w8a16_gemm implementation."""
-    return _custom_ops.allspark_w8a16_gemm(
+    """Use an explicitly enabled SM90 implementation, otherwise stock vLLM."""
+    from kernelgenbench.runtime.h20_allspark import h20_allspark_ops
+    h20_ops = h20_allspark_ops(a)
+    implementation = h20_ops.allspark_w8a16_gemm if h20_ops is not None else _custom_ops.allspark_w8a16_gemm
+    return implementation(
         a,
         b_qweight,
         b_scales,
