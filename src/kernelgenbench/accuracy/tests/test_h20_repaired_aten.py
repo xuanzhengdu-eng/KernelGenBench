@@ -74,6 +74,25 @@ def test_repaired_aten_cpu_scenarios():
             pass
         else:
             raise AssertionError('input-mutating bmm candidate was not rejected')
+
+        # The empty-index contract must exercise both reference and candidate;
+        # an internal upstream assertion must remain a visible failure.
+        calls = []
+        def expected_index_error(inp, indices):
+            calls.append(state['candidate'])
+            raise IndexError('at least one index must be provided')
+        suite.torch.ops.aten.index = expected_index_error
+        suite.test_index_error_empty_indices(torch.float32)
+        assert calls == [False, True]
+        def broken_reference(inp, indices):
+            raise RuntimeError('INTERNAL ASSERT FAILED')
+        suite.torch.ops.aten.index = broken_reference
+        try:
+            suite.test_index_error_empty_indices(torch.float32)
+        except RuntimeError as exc:
+            assert 'INTERNAL ASSERT FAILED' in str(exc)
+        else:
+            raise AssertionError('upstream internal assertion was hidden')
         print(f'ATEN_CPU_SCENARIOS_PASSED={len(scenarios)}')
     ''')
     env = dict(os.environ, DISPATCH_TORCH_LIB='0')

@@ -9565,8 +9565,14 @@ def test_index_error_empty_indices(dtype):
     inp = torch.randn((32, 64), dtype=dtype, device=device)
     indices = []
 
-    with pytest.raises(ValueError, match="at least one index must be provided"):
+    # Newer PyTorch raises IndexError for this invalid index list. Verify the
+    # reference first so an upstream INTERNAL ASSERT is not counted as a pass,
+    # then independently verify the candidate under dispatch.
+    with pytest.raises(IndexError, match="at least one index must be provided"):
         torch.ops.aten.index(inp, indices)
+    with pytest.raises(IndexError, match="at least one index must be provided"):
+        with kernelgenbench.use_ops(REGISTERED_OPS):
+            torch.ops.aten.index(inp, indices)
 
 
 
